@@ -1,0 +1,34 @@
+Name: The LLVM/Clang compiler modified to intercept allocated type
+Short Name: llvm-allocated-type
+URL: http://llvm.org/
+Version: 0
+Revision: 167488
+License: University of Illinois Open Source License
+License File: LICENSE.TXT
+Security Critical: no
+
+Description:
+LLVM is a compiler infrastructure.
+Clang is a C, C++, Objective C and Objective C++ front-end for LLVM.
+
+Local Modifications:
+This package consists of a locally modified version of Clang.  It instruments
+code around 'new' and 'delete' expressions to skim allocated types and sizes.
+
+The difference from the original Clang is in allocated-type.patch.
+
+Usage:
+The feature is enabled by a compiler option "-fintercept-allocation-function".
+With the option, Clang automatically includes <typeinfo> and declares following
+two functions in each compiled source file:
+- void* __op_new_intercept__(void*, size_t, const std::type_info&)
+- void* __op_delete_intercept__(void*, size_t, const std::type_info&)
+
+Then, Clang inserts a call for one of these functions in every new/delete
+expressions as below.
+
+operator new(...) calls are replaced to 
+=> __op_new_intercept__(operator new(...), size, type) 
+
+operator delete(ptr [, size]) calls are replaced to 
+=> operator delete(__op_delete_intercept__(ptr, size, type) [, size]) 

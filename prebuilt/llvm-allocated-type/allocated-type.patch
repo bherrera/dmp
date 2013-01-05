@@ -1,0 +1,737 @@
+diff --git a/include/clang/AST/ExprCXX.h b/include/clang/AST/ExprCXX.h
+index 96603eb..7586cbb 100644
+--- a/include/clang/AST/ExprCXX.h
++++ b/include/clang/AST/ExprCXX.h
+@@ -1456,6 +1456,9 @@ class CXXNewExpr : public Expr {
+   /// null.
+   FunctionDecl *OperatorDelete;
+ 
++  // TODO(dmikurube): Add a comment.
++  FunctionDecl *OperatorNewIntercept;
++
+   /// \brief The allocated type-source information, as written in the source.
+   TypeSourceInfo *AllocatedTypeInfo;
+ 
+@@ -1530,6 +1533,9 @@ public:
+   FunctionDecl *getOperatorDelete() const { return OperatorDelete; }
+   void setOperatorDelete(FunctionDecl *D) { OperatorDelete = D; }
+ 
++  FunctionDecl *getOperatorNewIntercept() const { return OperatorNewIntercept; }
++  void setOperatorNewIntercept(FunctionDecl *D) { OperatorNewIntercept = D; }
++
+   bool isArray() const { return Array; }
+   Expr *getArraySize() {
+     return Array ? cast<Expr>(SubExprs[0]) : 0;
+@@ -1637,6 +1643,8 @@ public:
+ class CXXDeleteExpr : public Expr {
+   // Points to the operator delete overload that is used. Could be a member.
+   FunctionDecl *OperatorDelete;
++  // TODO(dmikurube): Add a comment.
++  FunctionDecl *OperatorDeleteIntercept;
+   // The pointer expression to be deleted.
+   Stmt *Argument;
+   // Location of the expression.
+@@ -1659,7 +1667,9 @@ public:
+     : Expr(CXXDeleteExprClass, ty, VK_RValue, OK_Ordinary, false, false,
+            arg->isInstantiationDependent(),
+            arg->containsUnexpandedParameterPack()),
+-      OperatorDelete(operatorDelete), Argument(arg), Loc(loc),
++      OperatorDelete(operatorDelete),
++      OperatorDeleteIntercept(0),
++      Argument(arg), Loc(loc),
+       GlobalDelete(globalDelete),
+       ArrayForm(arrayForm), ArrayFormAsWritten(arrayFormAsWritten),
+       UsualArrayDeleteWantsSize(usualArrayDeleteWantsSize) { }
+@@ -1679,6 +1689,12 @@ public:
+   }
+ 
+   FunctionDecl *getOperatorDelete() const { return OperatorDelete; }
++  FunctionDecl *getOperatorDeleteIntercept() const {
++    return OperatorDeleteIntercept;
++  }
++  void setOperatorDeleteIntercept(FunctionDecl *D) {
++    OperatorDeleteIntercept = D;
++  }
+ 
+   Expr *getArgument() { return cast<Expr>(Argument); }
+   const Expr *getArgument() const { return cast<Expr>(Argument); }
+diff --git a/include/clang/Basic/LangOptions.def b/include/clang/Basic/LangOptions.def
+index f4cba24..5e2ea5a 100644
+--- a/include/clang/Basic/LangOptions.def
++++ b/include/clang/Basic/LangOptions.def
+@@ -127,6 +127,8 @@ BENIGN_LANGOPT(DebuggerSupport , 1, 0, "debugger support")
+ BENIGN_LANGOPT(DebuggerCastResultToId, 1, 0, "for 'po' in the debugger, cast the result to id if it is of unknown type")
+ BENIGN_LANGOPT(DebuggerObjCLiteral , 1, 0, "debugger Objective-C literals and subscripting support")
+ 
++BENIGN_LANGOPT(InterceptAllocationFunctions , 1, 0, "intercepting allocation functions and allocated types")
++
+ BENIGN_LANGOPT(SpellChecking , 1, 1, "spell-checking")
+ LANGOPT(SinglePrecisionConstants , 1, 0, "treating double-precision floating point constants as single precision constants")
+ LANGOPT(FastRelaxedMath , 1, 0, "OpenCL fast relaxed math")
+diff --git a/include/clang/Driver/Options.td b/include/clang/Driver/Options.td
+index 2ace8f3..a625fdd 100644
+--- a/include/clang/Driver/Options.td
++++ b/include/clang/Driver/Options.td
+@@ -299,6 +299,9 @@ def fno_address_sanitizer : Flag<["-"], "fno-address-sanitizer">, Group<f_Group>
+ def fthread_sanitizer : Flag<["-"], "fthread-sanitizer">, Group<f_Group>,
+   HelpText<"Enable ThreadSanitizer instrumentation (race detection)">;
+ def fno_thread_sanitizer : Flag<["-"], "fno-thread-sanitizer">, Group<f_Group>;
++def fintercept_allocation_functions : Flag<["-"], "fintercept-allocation-functions">, Group<f_Group>, Flags<[CC1Option]>,
++  HelpText<"Intercept allocation functions and allocated types">;
++def fno_intercept_allocation_functions : Flag<["-"], "fno-intercept-allocation-functions">, Group<f_Group>, Flags<[CC1Option]>;
+ def fasm : Flag<["-"], "fasm">, Group<f_Group>;
+ 
+ def fasm_blocks : Flag<["-"], "fasm-blocks">, Group<f_Group>;
+diff --git a/include/clang/Sema/Sema.h b/include/clang/Sema/Sema.h
+index 4183dcf..8483209 100644
+--- a/include/clang/Sema/Sema.h
++++ b/include/clang/Sema/Sema.h
+@@ -3260,6 +3260,9 @@ public:
+   NamespaceDecl *getStdNamespace() const;
+   NamespaceDecl *getOrCreateStdNamespace();
+ 
++  RecordDecl *getCXXTypeInfoDecl() const;
++  RecordDecl *getOrCreateCXXTypeInfoDecl();
++
+   CXXRecordDecl *getStdBadAlloc() const;
+ 
+   /// \brief Tests whether Ty is an instance of std::initializer_list and, if
+@@ -3790,6 +3793,7 @@ public:
+   void DeclareGlobalAllocationFunction(DeclarationName Name, QualType Return,
+                                        QualType Argument,
+                                        bool addMallocAttr = false);
++  void DeclareGlobalAllocatorInterceptFunctions(DeclarationName Name);
+ 
+   bool FindDeallocationFunction(SourceLocation StartLoc, CXXRecordDecl *RD,
+                                 DeclarationName Name, FunctionDecl* &Operator,
+diff --git a/lib/AST/ExprCXX.cpp b/lib/AST/ExprCXX.cpp
+index 9758b60..ec8dc42 100644
+--- a/lib/AST/ExprCXX.cpp
++++ b/lib/AST/ExprCXX.cpp
+@@ -94,6 +94,7 @@ CXXNewExpr::CXXNewExpr(ASTContext &C, bool globalNew, FunctionDecl *operatorNew,
+          ty->isInstantiationDependentType(),
+          ty->containsUnexpandedParameterPack()),
+     SubExprs(0), OperatorNew(operatorNew), OperatorDelete(operatorDelete),
++    OperatorNewIntercept(0),
+     AllocatedTypeInfo(allocatedTypeInfo), TypeIdParens(typeIdParens),
+     StartLoc(startLoc), DirectInitRange(directInitRange),
+     GlobalNew(globalNew), UsualArrayDeleteWantsSize(usualArrayDeleteWantsSize) {
+diff --git a/lib/CodeGen/CGClass.cpp b/lib/CodeGen/CGClass.cpp
+index b583c62..757949d 100644
+--- a/lib/CodeGen/CGClass.cpp
++++ b/lib/CodeGen/CGClass.cpp
+@@ -973,7 +973,9 @@ namespace {
+     void Emit(CodeGenFunction &CGF, Flags flags) {
+       const CXXDestructorDecl *Dtor = cast<CXXDestructorDecl>(CGF.CurCodeDecl);
+       const CXXRecordDecl *ClassDecl = Dtor->getParent();
+-      CGF.EmitDeleteCall(Dtor->getOperatorDelete(), CGF.LoadCXXThis(),
++      // TODO(dmikurube): Not 0 for OperatorDeleteIntercept?
++      CGF.EmitDeleteCall(Dtor->getOperatorDelete(),
++                         0, CGF.LoadCXXThis(),
+                          CGF.getContext().getTagDeclType(ClassDecl));
+     }
+   };
+diff --git a/lib/CodeGen/CGExprCXX.cpp b/lib/CodeGen/CGExprCXX.cpp
+index 7f640f6..926c325 100644
+--- a/lib/CodeGen/CGExprCXX.cpp
++++ b/lib/CodeGen/CGExprCXX.cpp
+@@ -1227,6 +1227,31 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
+                   allocatorArgs, allocator);
+   }
+ 
++  FunctionDecl *Intercept = E->getOperatorNewIntercept();
++  if (getContext().getLangOpts().InterceptAllocationFunctions &&
++      getContext().getLangOpts().RTTI &&
++      Intercept) {
++    const FunctionProtoType *InterceptType =
++      Intercept->getType()->castAs<FunctionProtoType>();
++
++    QualType ThirdType = InterceptType->getArgType(2);
++    const IdentifierInfo *identifier = ThirdType.getBaseTypeIdentifier();
++    if (identifier && strcmp(identifier->getNameStart(), "type_info") == 0) {
++      llvm::Value* TypeInfo = Builder.CreateBitCast(
++        CGM.GetAddrOfRTTIDescriptor(allocType.getUnqualifiedType()),
++        ConvertType(ThirdType));
++
++      CallArgList InterceptArgs;
++      InterceptArgs.add(RV, getContext().VoidPtrTy);
++      InterceptArgs.add(RValue::get(allocSize), sizeType);
++      InterceptArgs.add(RValue::get(TypeInfo), ThirdType);
++      RV = EmitCall(CGM.getTypes().arrangeFreeFunctionCall(InterceptArgs,
++                                                           InterceptType),
++                    CGM.GetAddrOfFunction(Intercept), ReturnValueSlot(),
++                    InterceptArgs, Intercept);
++    }
++  }
++
+   // Emit a null check on the allocation result if the allocation
+   // function is allowed to return null (because it has a non-throwing
+   // exception spec; for this part, we inline
+@@ -1317,6 +1342,7 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
+ }
+ 
+ void CodeGenFunction::EmitDeleteCall(const FunctionDecl *DeleteFD,
++                                     const FunctionDecl *DeleteFDIntercept,
+                                      llvm::Value *Ptr,
+                                      QualType DeleteTy) {
+   assert(DeleteFD->getOverloadedOperator() == OO_Delete);
+@@ -1338,7 +1364,39 @@ void CodeGenFunction::EmitDeleteCall(const FunctionDecl *DeleteFD,
+   
+   QualType ArgTy = DeleteFTy->getArgType(0);
+   llvm::Value *DeletePtr = Builder.CreateBitCast(Ptr, ConvertType(ArgTy));
+-  DeleteArgs.add(RValue::get(DeletePtr), ArgTy);
++
++  RValue RV = RValue::get(DeletePtr);
++  const FunctionDecl *Intercept = DeleteFDIntercept;
++  if (getContext().getLangOpts().InterceptAllocationFunctions &&
++      getContext().getLangOpts().RTTI &&
++      Intercept) {
++    const FunctionProtoType *InterceptType =
++      Intercept->getType()->castAs<FunctionProtoType>();
++
++    llvm::Value *SizeIntercept = 0;
++    QualType SecondType = InterceptType->getArgType(1);
++    CharUnits DeleteTypeSize = getContext().getTypeSizeInChars(DeleteTy);
++    SizeIntercept = llvm::ConstantInt::get(ConvertType(SecondType),
++                                           DeleteTypeSize.getQuantity());
++
++    QualType ThirdType = InterceptType->getArgType(2);
++    const IdentifierInfo *identifier = ThirdType.getBaseTypeIdentifier();
++    if (identifier && strcmp(identifier->getNameStart(), "type_info") == 0) {
++      llvm::Value* TypeInfo = Builder.CreateBitCast(
++        CGM.GetAddrOfRTTIDescriptor(DeleteTy.getUnqualifiedType()),
++        ConvertType(ThirdType));
++
++      CallArgList InterceptArgs;
++      InterceptArgs.add(RValue::get(DeletePtr), getContext().VoidPtrTy);
++      InterceptArgs.add(RValue::get(SizeIntercept), SecondType);
++      InterceptArgs.add(RValue::get(TypeInfo), ThirdType);
++      RV = EmitCall(CGM.getTypes().arrangeFreeFunctionCall(InterceptArgs,
++                                                           InterceptType),
++                    CGM.GetAddrOfFunction(Intercept), ReturnValueSlot(),
++                    InterceptArgs, Intercept);
++    }
++  }
++  DeleteArgs.add(RV, ArgTy);
+ 
+   if (Size)
+     DeleteArgs.add(RValue::get(Size), SizeTy);
+@@ -1354,15 +1412,20 @@ namespace {
+   struct CallObjectDelete : EHScopeStack::Cleanup {
+     llvm::Value *Ptr;
+     const FunctionDecl *OperatorDelete;
++    const FunctionDecl *OperatorDeleteIntercept;
+     QualType ElementType;
+ 
+     CallObjectDelete(llvm::Value *Ptr,
+                      const FunctionDecl *OperatorDelete,
++                     const FunctionDecl *OperatorDeleteIntercept,
+                      QualType ElementType)
+-      : Ptr(Ptr), OperatorDelete(OperatorDelete), ElementType(ElementType) {}
++      : Ptr(Ptr), OperatorDelete(OperatorDelete),
++        OperatorDeleteIntercept(OperatorDeleteIntercept),
++        ElementType(ElementType) {}
+ 
+     void Emit(CodeGenFunction &CGF, Flags flags) {
+-      CGF.EmitDeleteCall(OperatorDelete, Ptr, ElementType);
++      CGF.EmitDeleteCall(OperatorDelete, OperatorDeleteIntercept, Ptr,
++                         ElementType);
+     }
+   };
+ }
+@@ -1370,6 +1433,7 @@ namespace {
+ /// Emit the code for deleting a single object.
+ static void EmitObjectDelete(CodeGenFunction &CGF,
+                              const FunctionDecl *OperatorDelete,
++                             const FunctionDecl *OperatorDeleteIntercept,
+                              llvm::Value *Ptr,
+                              QualType ElementType,
+                              bool UseGlobalDelete) {
+@@ -1393,6 +1457,7 @@ static void EmitObjectDelete(CodeGenFunction &CGF,
+ 
+           CGF.EHStack.pushCleanup<CallObjectDelete>(NormalAndEHCleanup,
+                                                     completePtr, OperatorDelete,
++                                                    OperatorDeleteIntercept,
+                                                     ElementType);
+         }
+         
+@@ -1421,7 +1486,9 @@ static void EmitObjectDelete(CodeGenFunction &CGF,
+   // This doesn't have to a conditional cleanup because we're going
+   // to pop it off in a second.
+   CGF.EHStack.pushCleanup<CallObjectDelete>(NormalAndEHCleanup,
+-                                            Ptr, OperatorDelete, ElementType);
++                                            Ptr, OperatorDelete,
++                                            OperatorDeleteIntercept,
++                                            ElementType);
+ 
+   if (Dtor)
+     CGF.EmitCXXDestructorCall(Dtor, Dtor_Complete,
+@@ -1457,16 +1524,20 @@ namespace {
+   struct CallArrayDelete : EHScopeStack::Cleanup {
+     llvm::Value *Ptr;
+     const FunctionDecl *OperatorDelete;
++    const FunctionDecl *OperatorDeleteIntercept;
+     llvm::Value *NumElements;
+     QualType ElementType;
+     CharUnits CookieSize;
+ 
+     CallArrayDelete(llvm::Value *Ptr,
+                     const FunctionDecl *OperatorDelete,
++                    const FunctionDecl *OperatorDeleteIntercept,
+                     llvm::Value *NumElements,
+                     QualType ElementType,
+                     CharUnits CookieSize)
+-      : Ptr(Ptr), OperatorDelete(OperatorDelete), NumElements(NumElements),
++      : Ptr(Ptr), OperatorDelete(OperatorDelete),
++        OperatorDeleteIntercept(OperatorDeleteIntercept),
++        NumElements(NumElements),
+         ElementType(ElementType), CookieSize(CookieSize) {}
+ 
+     void Emit(CodeGenFunction &CGF, Flags flags) {
+@@ -1480,7 +1551,42 @@ namespace {
+       QualType VoidPtrTy = DeleteFTy->getArgType(0);
+       llvm::Value *DeletePtr
+         = CGF.Builder.CreateBitCast(Ptr, CGF.ConvertType(VoidPtrTy));
+-      Args.add(RValue::get(DeletePtr), VoidPtrTy);
++
++      RValue RV = RValue::get(DeletePtr);
++      const FunctionDecl *Intercept = OperatorDeleteIntercept;
++      if (CGF.CGM.getContext().getLangOpts().InterceptAllocationFunctions &&
++          CGF.CGM.getContext().getLangOpts().RTTI &&
++          Intercept) {
++        const FunctionProtoType *InterceptType =
++          Intercept->getType()->castAs<FunctionProtoType>();
++
++        llvm::Value *SizeIntercept = 0;
++        QualType SecondType = InterceptType->getArgType(1);
++        CharUnits DeleteTypeSize =
++          CGF.CGM.getContext().getTypeSizeInChars(ElementType);
++        SizeIntercept = llvm::ConstantInt::get(CGF.ConvertType(SecondType),
++                                               DeleteTypeSize.getQuantity());
++
++        QualType ThirdType = InterceptType->getArgType(2);
++        const IdentifierInfo *identifier = ThirdType.getBaseTypeIdentifier();
++        if (identifier && strcmp(identifier->getNameStart(), "type_info") == 0) {
++          llvm::Value* TypeInfo = CGF.Builder.CreateBitCast(
++            CGF.CGM.GetAddrOfRTTIDescriptor(ElementType.getUnqualifiedType()),
++            CGF.ConvertType(ThirdType));
++
++          CallArgList InterceptArgs;
++          InterceptArgs.add(RValue::get(DeletePtr),
++                            CGF.CGM.getContext().VoidPtrTy);
++          InterceptArgs.add(RValue::get(SizeIntercept), SecondType);
++          InterceptArgs.add(RValue::get(TypeInfo), ThirdType);
++          RV = CGF.EmitCall(CGF.CGM.getTypes().arrangeFreeFunctionCall(
++                              InterceptArgs, InterceptType),
++                            CGF.CGM.GetAddrOfFunction(Intercept),
++                            ReturnValueSlot(),
++                            InterceptArgs, Intercept);
++        }
++      }
++      Args.add(RV, VoidPtrTy);
+ 
+       // Pass the original requested size as the second argument.
+       if (DeleteFTy->getNumArgs() == 2) {
+@@ -1529,8 +1635,10 @@ static void EmitArrayDelete(CodeGenFunction &CGF,
+ 
+   // Make sure that we call delete even if one of the dtors throws.
+   const FunctionDecl *operatorDelete = E->getOperatorDelete();
++  const FunctionDecl *operatorDeleteIntercept = E->getOperatorDeleteIntercept();
+   CGF.EHStack.pushCleanup<CallArrayDelete>(NormalAndEHCleanup,
+                                            allocatedPtr, operatorDelete,
++                                           operatorDeleteIntercept,
+                                            numElements, elementType,
+                                            cookieSize);
+ 
+@@ -1596,7 +1704,8 @@ void CodeGenFunction::EmitCXXDeleteExpr(const CXXDeleteExpr *E) {
+   if (E->isArrayForm()) {
+     EmitArrayDelete(*this, E, Ptr, DeleteTy);
+   } else {
+-    EmitObjectDelete(*this, E->getOperatorDelete(), Ptr, DeleteTy,
++    EmitObjectDelete(*this, E->getOperatorDelete(),
++                     E->getOperatorDeleteIntercept(), Ptr, DeleteTy,
+                      E->isGlobalDelete());
+   }
+ 
+diff --git a/lib/CodeGen/CodeGenFunction.h b/lib/CodeGen/CodeGenFunction.h
+index fadc391..f13eb8e 100644
+--- a/lib/CodeGen/CodeGenFunction.h
++++ b/lib/CodeGen/CodeGenFunction.h
+@@ -407,6 +407,14 @@ public:
+     (void) Obj;
+   }
+ 
++  /// Push a lazily-created cleanup on the stack.
++  template <class T, class A0, class A1, class A2, class A3, class A4, class A5>
++  void pushCleanup(CleanupKind Kind, A0 a0, A1 a1, A2 a2, A3 a3, A4 a4, A5 a5) {
++    void *Buffer = pushCleanup(Kind, sizeof(T));
++    Cleanup *Obj = new(Buffer) T(a0, a1, a2, a3, a4, a5);
++    (void) Obj;
++  }
++
+   // Feel free to add more variants of the following:
+ 
+   /// Push a cleanup with non-constant storage requirements on the
+@@ -1845,8 +1853,9 @@ public:
+   llvm::Value *EmitCXXNewExpr(const CXXNewExpr *E);
+   void EmitCXXDeleteExpr(const CXXDeleteExpr *E);
+ 
+-  void EmitDeleteCall(const FunctionDecl *DeleteFD, llvm::Value *Ptr,
+-                      QualType DeleteTy);
++  void EmitDeleteCall(const FunctionDecl *DeleteFD,
++                      const FunctionDecl *DeleteFDIntercept,
++                      llvm::Value *Ptr, QualType DeleteTy);
+ 
+   llvm::Value* EmitCXXTypeidExpr(const CXXTypeidExpr *E);
+   llvm::Value *EmitDynamicCast(llvm::Value *V, const CXXDynamicCastExpr *DCE);
+diff --git a/lib/Driver/Tools.cpp b/lib/Driver/Tools.cpp
+index 2eca3fe..48869ea 100644
+--- a/lib/Driver/Tools.cpp
++++ b/lib/Driver/Tools.cpp
+@@ -2444,6 +2444,13 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
+   if (getToolChain().SupportsProfiling())
+     Args.AddLastArg(CmdArgs, options::OPT_pg);
+ 
++  if (Args.hasFlag(options::OPT_fintercept_allocation_functions,
++                   options::OPT_fno_intercept_allocation_functions, false)) {
++    CmdArgs.push_back("-fintercept-allocation-functions");
++    CmdArgs.push_back("-include");
++    CmdArgs.push_back("typeinfo");
++  }
++
+   // -flax-vector-conversions is default.
+   if (!Args.hasFlag(options::OPT_flax_vector_conversions,
+                     options::OPT_fno_lax_vector_conversions))
+diff --git a/lib/Frontend/CompilerInvocation.cpp b/lib/Frontend/CompilerInvocation.cpp
+index d0ff7d2..b2825fd 100644
+--- a/lib/Frontend/CompilerInvocation.cpp
++++ b/lib/Frontend/CompilerInvocation.cpp
+@@ -1233,6 +1233,8 @@ static void ParseLangArgs(LangOptions &Opts, ArgList &Args, InputKind IK,
+   Opts.DebuggerSupport = Args.hasArg(OPT_fdebugger_support);
+   Opts.DebuggerCastResultToId = Args.hasArg(OPT_fdebugger_cast_result_to_id);
+   Opts.DebuggerObjCLiteral = Args.hasArg(OPT_fdebugger_objc_literal);
++  Opts.InterceptAllocationFunctions =
++    Args.hasArg(OPT_fintercept_allocation_functions);
+   Opts.ApplePragmaPack = Args.hasArg(OPT_fapple_pragma_pack);
+   Opts.CurrentModule = Args.getLastArgValue(OPT_fmodule_name);
+ 
+diff --git a/lib/Sema/SemaDeclCXX.cpp b/lib/Sema/SemaDeclCXX.cpp
+index f9eb9eb..078cdb3 100644
+--- a/lib/Sema/SemaDeclCXX.cpp
++++ b/lib/Sema/SemaDeclCXX.cpp
+@@ -5160,6 +5160,7 @@ bool Sema::CheckDestructor(CXXDestructorDecl *Destructor) {
+ 
+     MarkFunctionReferenced(Loc, OperatorDelete);
+     
++    // TODO(dmikurube): OperatorDeleteIntercept required?
+     Destructor->setOperatorDelete(OperatorDelete);
+   }
+   
+@@ -5664,6 +5665,32 @@ NamespaceDecl *Sema::getOrCreateStdNamespace() {
+   return getStdNamespace();
+ }
+ 
++RecordDecl *Sema::getCXXTypeInfoDecl() const {
++  return CXXTypeInfoDecl;
++}
++
++RecordDecl *Sema::getOrCreateCXXTypeInfoDecl() {
++  if (!CXXTypeInfoDecl) {
++    IdentifierInfo *TypeInfoII = &PP.getIdentifierTable().get("type_info");
++    LookupResult R(*this, TypeInfoII, SourceLocation(), LookupTagName);
++    NamespaceDecl* StdNamespace = getStdNamespace();
++    if (!StdNamespace)
++      return NULL;
++    LookupQualifiedName(R, StdNamespace);
++    CXXTypeInfoDecl = R.getAsSingle<RecordDecl>();
++    // Microsoft's typeinfo doesn't have type_info in std but in the global
++    // namespace if _HAS_EXCEPTIONS is defined to 0. See PR13153.
++    if (!CXXTypeInfoDecl && LangOpts.MicrosoftMode) {
++      LookupQualifiedName(R, Context.getTranslationUnitDecl());
++      CXXTypeInfoDecl = R.getAsSingle<RecordDecl>();
++    }
++    if (!CXXTypeInfoDecl)
++      return NULL;
++  }
++
++  return getCXXTypeInfoDecl();
++}
++
+ bool Sema::isStdInitializerList(QualType Ty, QualType *Element) {
+   assert(getLangOpts().CPlusPlus &&
+          "Looking for std::initializer_list outside of C++.");
+diff --git a/lib/Sema/SemaExprCXX.cpp b/lib/Sema/SemaExprCXX.cpp
+index bed6cb0..609833a 100644
+--- a/lib/Sema/SemaExprCXX.cpp
++++ b/lib/Sema/SemaExprCXX.cpp
+@@ -371,26 +371,15 @@ Sema::ActOnCXXTypeid(SourceLocation OpLoc, SourceLocation LParenLoc,
+   if (!getStdNamespace())
+     return ExprError(Diag(OpLoc, diag::err_need_header_before_typeid));
+ 
+-  if (!CXXTypeInfoDecl) {
+-    IdentifierInfo *TypeInfoII = &PP.getIdentifierTable().get("type_info");
+-    LookupResult R(*this, TypeInfoII, SourceLocation(), LookupTagName);
+-    LookupQualifiedName(R, getStdNamespace());
+-    CXXTypeInfoDecl = R.getAsSingle<RecordDecl>();
+-    // Microsoft's typeinfo doesn't have type_info in std but in the global
+-    // namespace if _HAS_EXCEPTIONS is defined to 0. See PR13153.
+-    if (!CXXTypeInfoDecl && LangOpts.MicrosoftMode) {
+-      LookupQualifiedName(R, Context.getTranslationUnitDecl());
+-      CXXTypeInfoDecl = R.getAsSingle<RecordDecl>();
+-    }
+-    if (!CXXTypeInfoDecl)
+-      return ExprError(Diag(OpLoc, diag::err_need_header_before_typeid));
+-  }
++  RecordDecl* TypeInfoDecl = getOrCreateCXXTypeInfoDecl();
++  if (!TypeInfoDecl)
++    return ExprError(Diag(OpLoc, diag::err_need_header_before_typeid));
+ 
+   if (!getLangOpts().RTTI) {
+     return ExprError(Diag(OpLoc, diag::err_no_typeid_with_fno_rtti));
+   }
+ 
+-  QualType TypeInfoType = Context.getTypeDeclType(CXXTypeInfoDecl);
++  QualType TypeInfoType = Context.getTypeDeclType(TypeInfoDecl);
+ 
+   if (isType) {
+     // The operand is a type; handle it as such.
+@@ -1400,14 +1389,75 @@ Sema::BuildCXXNew(SourceLocation StartLoc, bool UseGlobal,
+     }
+   }
+ 
+-  return Owned(new (Context) CXXNewExpr(Context, UseGlobal, OperatorNew,
+-                                        OperatorDelete,
+-                                        UsualArrayDeleteWantsSize,
+-                                   llvm::makeArrayRef(PlaceArgs, NumPlaceArgs),
+-                                        TypeIdParens,
+-                                        ArraySize, initStyle, Initializer,
+-                                        ResultType, AllocTypeInfo,
+-                                        StartLoc, DirectInitRange));
++  CXXNewExpr* Result =
++    new (Context) CXXNewExpr(Context, UseGlobal, OperatorNew,
++                             OperatorDelete,
++                             UsualArrayDeleteWantsSize,
++                             llvm::makeArrayRef(PlaceArgs, NumPlaceArgs),
++                             TypeIdParens,
++                             ArraySize, initStyle, Initializer,
++                             ResultType, AllocTypeInfo,
++                             StartLoc, DirectInitRange);
++
++  if (getLangOpts().InterceptAllocationFunctions &&
++      getLangOpts().RTTI) {
++    IdentifierInfo *NewInterceptInfo =
++        &PP.getIdentifierTable().get("__op_new_intercept__");
++    DeclareGlobalAllocatorInterceptFunctions(
++        DeclarationName(NewInterceptInfo));
++    LookupResult R(*this, NewInterceptInfo, SourceLocation(),
++                   LookupOrdinaryName);
++    LookupQualifiedName(R, Context.getTranslationUnitDecl());
++
++    RecordDecl* TypeInfoDecl = getOrCreateCXXTypeInfoDecl();
++    if (!R.empty() && !R.isAmbiguous() && TypeInfoDecl) {
++      R.suppressDiagnostics();
++
++      QualType TypeInfoType = Context.getTypeDeclType(TypeInfoDecl);
++      TypeSourceInfo* TemporaryTypeSourceInfo =
++        Context.getTrivialTypeSourceInfo(Context.VoidPtrTy);
++      CXXTypeidExpr* TemporaryTypeidExpr =
++        new (Context) CXXTypeidExpr(TypeInfoType.withConst(),
++                                    TemporaryTypeSourceInfo,
++                                    SourceRange(StartLoc, StartLoc));
++
++      OverloadCandidateSet Candidates(StartLoc);
++      for (LookupResult::iterator Intercept = R.begin(), InterceptEnd = R.end();
++           Intercept != InterceptEnd; ++Intercept) {
++        // Even member operator new/delete are implicitly treated as
++        // static, so don't use AddMemberCandidate.
++        NamedDecl *D = (*Intercept)->getUnderlyingDecl();
++        FunctionDecl *Fn = cast<FunctionDecl>(D);
++
++        CXXNullPtrLiteralExpr Null(Context.VoidPtrTy, SourceLocation());
++        IntegerLiteral Size(Context,
++          llvm::APInt::getNullValue(Context.getTargetInfo().getPointerWidth(0)),
++          Context.getSizeType(),
++          SourceLocation());
++        Expr* InterceptArgs[3];
++        InterceptArgs[0] = &Null;
++        InterceptArgs[1] = &Size;
++        InterceptArgs[2] = TemporaryTypeidExpr;
++        AddOverloadCandidate(Fn, Intercept.getPair(),
++                             llvm::makeArrayRef(InterceptArgs, 3), Candidates,
++                             /*SuppressUserConversions=*/false);
++      }
++
++      // Do the resolution.
++      OverloadCandidateSet::iterator Best;
++      switch (Candidates.BestViableFunction(*this, StartLoc, Best)) {
++      case OR_Success: {
++        FunctionDecl* Fn = Best->Function;
++        Result->setOperatorNewIntercept(Fn);
++        MarkFunctionReferenced(StartLoc, Fn);
++      }
++      default:
++        ;
++      }
++    }
++  }
++
++  return Owned(Result);
+ }
+ 
+ /// \brief Checks that a type is suitable as the allocated type
+@@ -1847,6 +1897,80 @@ void Sema::DeclareGlobalNewDelete() {
+       Context.VoidTy, VoidPtr);
+ }
+ 
++/// DeclareGlobalAllocatorInterceptFunctions - Declares a single implicit global
++/// allocator intercept functions if it doesn't already exist.
++void Sema::DeclareGlobalAllocatorInterceptFunctions(DeclarationName Name) {
++  DeclContext *GlobalCtx = Context.getTranslationUnitDecl();
++
++  QualType VoidPtrType = Context.getPointerType(Context.VoidTy);
++  QualType SizeType = Context.getSizeType();
++
++  RecordDecl* TypeInfoDecl = getOrCreateCXXTypeInfoDecl();
++  QualType TypeInfoType = Context.getTypeDeclType(TypeInfoDecl);
++  QualType ConstRefTypeInfoType = Context.getLValueReferenceType(
++      TypeInfoType.withConst());
++
++  // Check if this function is already declared.
++  {
++    DeclContext::lookup_iterator Intercept, InterceptEnd;
++    for (llvm::tie(Intercept, InterceptEnd) = GlobalCtx->lookup(Name);
++         Intercept != InterceptEnd; ++Intercept) {
++      // Only look at non-template functions, as it is the predefined,
++      // non-templated allocation function we are trying to declare here.
++      if (FunctionDecl *Func = dyn_cast<FunctionDecl>(*Intercept)) {
++        if (Func->getNumParams() != 3)
++          continue;
++        QualType ParamType1 = Context.getCanonicalType(
++            Func->getParamDecl(0)->getType().getUnqualifiedType());
++        QualType ParamType2 = Context.getCanonicalType(
++            Func->getParamDecl(1)->getType().getUnqualifiedType());
++        QualType ParamType3 = Context.getCanonicalType(
++            Func->getParamDecl(2)->getType().getUnqualifiedType());
++        // FIXME: Do we need to check for default arguments here?
++        if (ParamType1 == VoidPtrType &&
++            ParamType2 == SizeType &&
++            ParamType3 == ConstRefTypeInfoType) {
++          return;
++        }
++      }
++    }
++  }
++
++  QualType ArgumentArray[3] = { VoidPtrType, SizeType, ConstRefTypeInfoType };
++
++  FunctionProtoType::ExtProtoInfo EPI;
++  QualType FnType = Context.getFunctionType(VoidPtrType, ArgumentArray, 3, EPI);
++  FunctionDecl *Intercept =
++    FunctionDecl::Create(Context, GlobalCtx, SourceLocation(),
++                         SourceLocation(), Name,
++                         FnType, /*TInfo=*/0, SC_None,
++                         SC_None, false, true);
++  Intercept->setImplicit();
++
++  SmallVector<ParmVarDecl*, 16> Params;
++  ParmVarDecl *Param1 = ParmVarDecl::Create(Context, Intercept,
++                                            SourceLocation(), SourceLocation(),
++                                            0, VoidPtrType,
++                                            /*TInfo=*/0, SC_None, SC_None, 0);
++  Params.push_back(Param1);
++  ParmVarDecl *Param2 = ParmVarDecl::Create(Context, Intercept,
++                                            SourceLocation(), SourceLocation(),
++                                            0, SizeType,
++                                            /*TInfo=*/0, SC_None, SC_None, 0);
++  Params.push_back(Param2);
++  ParmVarDecl *Param3 = ParmVarDecl::Create(Context, Intercept,
++                                            SourceLocation(), SourceLocation(),
++                                            0, ConstRefTypeInfoType,
++                                            /*TInfo=*/0, SC_None, SC_None, 0);
++  Params.push_back(Param3);
++  Intercept->setParams(Params);
++
++  // FIXME: Also add this declaration to the IdentifierResolver, but
++  // make sure it is at the end of the chain to coincide with the
++  // global scope.
++  Context.getTranslationUnitDecl()->addDecl(Intercept);
++}
++
+ /// DeclareGlobalAllocationFunction - Declares a single implicit global
+ /// allocation function if it doesn't already exist.
+ void Sema::DeclareGlobalAllocationFunction(DeclarationName Name,
+@@ -2206,10 +2330,70 @@ Sema::ActOnCXXDelete(SourceLocation StartLoc, bool UseGlobal,
+ 
+   }
+ 
+-  return Owned(new (Context) CXXDeleteExpr(Context.VoidTy, UseGlobal, ArrayForm,
+-                                           ArrayFormAsWritten,
+-                                           UsualArrayDeleteWantsSize,
+-                                           OperatorDelete, Ex.take(), StartLoc));
++  CXXDeleteExpr* Result =
++    new (Context) CXXDeleteExpr(Context.VoidTy, UseGlobal, ArrayForm,
++                                ArrayFormAsWritten,
++                                UsualArrayDeleteWantsSize,
++                                OperatorDelete, Ex.take(), StartLoc);
++
++  if (getLangOpts().InterceptAllocationFunctions &&
++      getLangOpts().RTTI) {
++    IdentifierInfo *DeleteInterceptInfo =
++        &PP.getIdentifierTable().get("__op_delete_intercept__");
++    DeclareGlobalAllocatorInterceptFunctions(
++        DeclarationName(DeleteInterceptInfo));
++    LookupResult R(*this, DeleteInterceptInfo, SourceLocation(),
++                   LookupOrdinaryName);
++    LookupQualifiedName(R, Context.getTranslationUnitDecl());
++
++    RecordDecl* TypeInfoDecl = getOrCreateCXXTypeInfoDecl();
++    if (!R.empty() && !R.isAmbiguous() && TypeInfoDecl) {
++      R.suppressDiagnostics();
++
++      QualType TypeInfoType = Context.getTypeDeclType(TypeInfoDecl);
++      TypeSourceInfo* TemporaryTypeSourceInfo =
++        Context.getTrivialTypeSourceInfo(Context.VoidPtrTy);
++      CXXTypeidExpr* TemporaryTypeidExpr =
++        new (Context) CXXTypeidExpr(TypeInfoType.withConst(),
++                                    TemporaryTypeSourceInfo,
++                                    SourceRange(StartLoc, StartLoc));
++
++      OverloadCandidateSet Candidates(StartLoc);
++      for (LookupResult::iterator Intercept = R.begin(), InterceptEnd = R.end();
++           Intercept != InterceptEnd; ++Intercept) {
++        // Even member operator new/delete are implicitly treated as
++        // static, so don't use AddMemberCandidate.
++        NamedDecl *D = (*Intercept)->getUnderlyingDecl();
++        FunctionDecl *Fn = cast<FunctionDecl>(D);
++
++        CXXNullPtrLiteralExpr Null(Context.VoidPtrTy, SourceLocation());
++        IntegerLiteral Size(Context,
++          llvm::APInt::getNullValue(Context.getTargetInfo().getPointerWidth(0)),
++          Context.getSizeType(), SourceLocation());
++        Expr* InterceptArgs[3];
++        InterceptArgs[0] = &Null;
++        InterceptArgs[1] = &Size;
++        InterceptArgs[2] = TemporaryTypeidExpr;
++        AddOverloadCandidate(Fn, Intercept.getPair(),
++                             llvm::makeArrayRef(InterceptArgs, 3), Candidates,
++                             /*SuppressUserConversions=*/false);
++      }
++
++      // Do the resolution.
++      OverloadCandidateSet::iterator Best;
++      switch (Candidates.BestViableFunction(*this, StartLoc, Best)) {
++      case OR_Success: {
++        FunctionDecl* Fn = Best->Function;
++        Result->setOperatorDeleteIntercept(Fn);
++        MarkFunctionReferenced(StartLoc, Fn);
++      }
++      default:
++        ;
++      }
++    }
++  }
++
++  return Owned(Result);
+ }
+ 
+ /// \brief Check the use of the given variable as a C++ condition in an if,
