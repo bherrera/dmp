@@ -5,16 +5,26 @@ include_directories(${PROJECT_SOURCE_DIR})
 include_directories(${THIRD_PARTY_DIR}/tcmalloc/chromium/src/base)
 include_directories(${THIRD_PARTY_DIR}/tcmalloc/chromium/src)
 
+SET(CMAKE_C_FLAGS "-m32")
+SET(CMAKE_CXX_FLAGS "-m32")
+SET(CMAKE_LD_FLAGS "-m32 -Wl,-uIsHeapProfilerRunning,-uProfilerStart 
+  -Wl,-u_Z21InitialMallocHook_NewPKvj,-u_Z22InitialMallocHook_MMapPKvS0_jiiix,-u_Z22InitialMallocHook_SbrkPKvi
+  -Wl,-u_Z21InitialMallocHook_NewPKvm,-u_Z22InitialMallocHook_MMapPKvS0_miiil,-u_Z22InitialMallocHook_SbrkPKvl
+  -Wl,-u_ZN15HeapLeakChecker12IgnoreObjectEPKv,-u_ZN15HeapLeakChecker14UnIgnoreObjectEPKv")
+
 set(TCMALLOC_SRCS ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/config.h 
   ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/config_linux.h 
   ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/config_win.h 
   ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/base/abort.cc 
   ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/base/abort.h 
   ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/base/arm_instruction_set_select.h 
-  ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/base/atomicops-internals-arm-generic.h 
-  ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/base/atomicops-internals-arm-v6plus.h 
-  ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/base/dynamic_annotations.h 
-  ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/base/elf_mem_image.cc 
+  ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/base/atomicops-internals-x86.h
+  ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/base/atomicops-internals-x86.cc
+#  ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/base/atomicops-internals-arm-generic.h 
+#  ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/base/atomicops-internals-arm-v6plus.h
+  ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/base/dynamic_annotations.h
+  ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/base/dynamic_annotations.c
+  ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/base/elf_mem_image.cc
   ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/base/linuxthreads.cc 
   ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/base/linuxthreads.h 
   ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/base/logging.cc 
@@ -45,7 +55,7 @@ set(TCMALLOC_SRCS ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/config.h
   ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/heap-checker.cc 
   ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/heap-profile-table.cc 
   ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/heap-profile-table.h 
-  ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/heap-profiler.cc 
+  ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/heap-profiler.cc
   ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/internal_logging.cc 
   ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/internal_logging.h 
   ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/linked_list.h 
@@ -87,16 +97,20 @@ set(TCMALLOC_SRCS ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/config.h
 )
 
 set(ALLOCATOR_EXTENSION_THUNKS_SRCS base/allocator/allocator_extension_thunks.cc
-  base/allocator/allocator_extension_thunks.h)
+  base/allocator/allocator_extension_thunks.h
+)
 
 set(TYPE_PROFILE_SRCS base/allocator/type_profiler.cc
   base/allocator/type_profiler.h
-  base/allocator/type_profiler_control.h)
+  base/allocator/type_profiler_control.h
+  base/allocator/type_profiler_control.cc
+)
 
 set(TYPE_PROFILER_TCMALLOC_SRCS base/allocator/type_profiler_tcmalloc.cc
   base/allocator/type_profiler_tcmalloc.h
   ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/gperftools/type_profiler_map.h
-  ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/type_profiler_map.cc)
+  ${THIRD_PARTY_DIR}/tcmalloc/chromium/src/type_profiler_map.cc
+)
 
 IF(linux_keep_shadow_stacks)
 #'sources': [
@@ -131,6 +145,7 @@ ENDIF(use_vtable_verify)
 #add_definitions(-frtti -gline-tables-only -fintercept-allocation-functions)
 add_definitions(-frtti -gline-tables-only -Wno-sign-compare -Wno-unused-result)
 add_definitions(-Wno-non-literal-null-conversion)
+add_definitions(-DTYPE_PROFILING)
 
 add_library(allocator STATIC ${TCMALLOC_SRCS})
 target_link_libraries(allocator type_profile_tcmalloc)
