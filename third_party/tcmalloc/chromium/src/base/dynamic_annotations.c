@@ -46,7 +46,7 @@
 # ifdef HAVE_VALGRIND_H    /* prefer the user's copy if they have it */
 #  include <valgrind.h>
 # else                     /* otherwise just use the copy that we have */
-#  include "third_party/valgrind.h"
+//#  include "third_party/valgrind.h"
 # endif
 #endif
 
